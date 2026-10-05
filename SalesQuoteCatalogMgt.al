@@ -178,10 +178,12 @@
             WarehouseRequest.SetRange(
                 "Source No.",
                 SalesHeader."No.");
-            if not WarehouseRequest.FindSet() then
-                Error(
-                    'Aucune demande d''entrepôt n''a été trouvée pour la commande %1.',
-                    SalesHeader."No.");
+            if not WarehouseRequest.FindSet() then begin
+                SalesHeader.Ship := true;
+                SalesHeader.Invoice := true;
+                SalesPost.Run(SalesHeader);
+                exit;
+            end;
             repeat
                 if not GetSourceDocOutbound.CreateWhseShipmentHeaderFromWhseRequest(
                     WarehouseRequest)
@@ -231,10 +233,6 @@
                 'Aucune ligne d''expédition entrepôt n''a été trouvée pour la commande %1.',
                 SalesHeader."No.");
 
-        SetWarehouseShipmentQtyToShip(
-            SalesHeader,
-            WarehouseShipmentLine);
-
         WarehouseShipmentLine.Reset();
         WarehouseShipmentLine.SetRange(
             "Source Type",
@@ -259,6 +257,10 @@
                 'Aucune quantité à expédier n''a été préparée pour la commande %1.',
                 SalesHeader."No.");
         foreach WarehouseShipmentNo in WarehouseShipmentsToPost do begin
+            SetWarehouseShipmentQtyToShip(
+                SalesHeader,
+                WarehouseShipmentLine,
+                WarehouseShipmentNo);
             ValidateWarehousePreparation(WarehouseShipmentNo);
 
             WarehouseShipmentLine.Reset();
@@ -304,8 +306,6 @@
         Location: Record Location;
         WarehouseShipmentHeader: Record "Warehouse Shipment Header";
         WarehouseShipmentLine: Record "Warehouse Shipment Line";
-        PickLocationCodes: List of [Code[10]];
-        PickLocationCode: Code[10];
         WhseShipmentRelease: Codeunit "Whse.-Shipment Release";
     begin
         WarehouseShipmentHeader.Get(WarehouseShipmentNo);
@@ -316,31 +316,17 @@
             WarehouseShipmentLine,
             SalesOrderNo,
             WarehouseShipmentNo);
-        if WarehouseShipmentLine.FindSet() then
+        if WarehouseShipmentLine.FindSet(true) then
             repeat
-                if not PickLocationCodes.Contains(WarehouseShipmentLine."Location Code") then
-                    if Location.Get(WarehouseShipmentLine."Location Code") then
-                        if Location."Require Pick" then
-                            PickLocationCodes.Add(WarehouseShipmentLine."Location Code");
+                if Location.Get(WarehouseShipmentLine."Location Code") then
+                    if Location."Require Pick" then begin
+                        WarehouseShipmentLine.SetHideValidationDialog(true);
+                        WarehouseShipmentLine.CreatePickDoc(
+                            WarehouseShipmentLine,
+                            WarehouseShipmentHeader);
+                    end;
             until WarehouseShipmentLine.Next() = 0;
-        foreach PickLocationCode in PickLocationCodes do begin
-            SetSalesOrderShipmentLineFilters(
-                WarehouseShipmentLine,
-                SalesOrderNo,
-                WarehouseShipmentNo);
-            WarehouseShipmentLine.SetRange(
-                "Location Code",
-                PickLocationCode);
-            if WarehouseShipmentLine.FindFirst() then begin
-                WarehouseShipmentLine.SetHideValidationDialog(true);
-                WarehouseShipmentLine.CreatePickDoc(
-                    WarehouseShipmentLine,
-                    WarehouseShipmentHeader);
-            end;
-        end;
-
         FillPickQuantitiesToHandle(WarehouseShipmentNo);
-        ForceWarehouseShipmentQtyToShip(WarehouseShipmentNo);
         RegisterWarehouseShipmentPicks(WarehouseShipmentNo);
     end;
 
@@ -366,7 +352,11 @@
 
     local procedure SetWarehouseShipmentQtyToShip(
         var SalesHeader: Record "Sales Header";
-        var WarehouseShipmentLine: Record "Warehouse Shipment Line")
+        var WarehouseShipmentLine: Record "Warehouse Shipment Line";
+        WarehouseShipmentNo: Code[20])
+    var
+        Location: Record Location;
+        QtyToShip: Decimal;
     begin
         WarehouseShipmentLine.Reset();
         WarehouseShipmentLine.SetRange(
@@ -378,32 +368,21 @@
         WarehouseShipmentLine.SetRange(
             "Source No.",
             SalesHeader."No.");
-        if WarehouseShipmentLine.FindSet(true) then
-            repeat
-                if WarehouseShipmentLine."Qty. Outstanding" > 0 then begin
-                    WarehouseShipmentLine.Validate(
-                        "Qty. to Ship",
-                        WarehouseShipmentLine."Qty. Outstanding");
-                    WarehouseShipmentLine.Modify(true);
-                end;
-            until WarehouseShipmentLine.Next() = 0;
-    end;
-
-    local procedure ForceWarehouseShipmentQtyToShip(
-        WarehouseShipmentNo: Code[20])
-    var
-        WarehouseShipmentLine: Record "Warehouse Shipment Line";
-    begin
-        WarehouseShipmentLine.Reset();
         WarehouseShipmentLine.SetRange(
             "No.",
             WarehouseShipmentNo);
         if WarehouseShipmentLine.FindSet(true) then
             repeat
-                if WarehouseShipmentLine."Qty. Outstanding" > 0 then begin
-                    WarehouseShipmentLine.Validate(
-                        "Qty. to Ship",
-                        WarehouseShipmentLine."Qty. Outstanding");
+                QtyToShip := WarehouseShipmentLine."Qty. Outstanding";
+                if Location.Get(WarehouseShipmentLine."Location Code") then
+                    if Location."Require Pick" then
+                        QtyToShip := WarehouseShipmentLine."Qty. Picked";
+
+                if QtyToShip > WarehouseShipmentLine."Qty. Outstanding" then
+                    QtyToShip := WarehouseShipmentLine."Qty. Outstanding";
+
+                if WarehouseShipmentLine."Qty. to Ship" <> QtyToShip then begin
+                    WarehouseShipmentLine.Validate("Qty. to Ship", QtyToShip);
                     WarehouseShipmentLine.Modify(true);
                 end;
             until WarehouseShipmentLine.Next() = 0;
@@ -494,11 +473,12 @@
                        (WarehouseShipmentLine."Qty. to Ship" = 0)
                     then
                         Error(
-                            'Expédition %1, article %2, emplacement %3 : Qty. Outstanding=%4, Qty. to Ship=%5. Vérifier le stock, le bin, Require Pick, le pick et l''enregistrement du prélèvement.',
+                            'Expédition %1, article %2, emplacement %3 : Qty. Outstanding=%4, Qty. Picked=%5, Qty. to Ship=%6. Vérifier le stock disponible dans un bin prélevable et le prélèvement enregistré.',
                             WarehouseShipmentLine."No.",
                             WarehouseShipmentLine."Item No.",
                             WarehouseShipmentLine."Location Code",
                             WarehouseShipmentLine."Qty. Outstanding",
+                            WarehouseShipmentLine."Qty. Picked",
                             WarehouseShipmentLine."Qty. to Ship");
                 end;
             until WarehouseShipmentLine.Next() = 0;
